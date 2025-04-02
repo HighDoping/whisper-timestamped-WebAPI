@@ -3,14 +3,14 @@
 __author__ = "Jérôme Louradour"
 __credits__ = ["Jérôme Louradour"]
 __license__ = "GPLv3"
-__version__ = "1.13.3"
+__version__ = "1.15.8"
 
 # Set some environment variables
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1' # Remove warning "This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)..."
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID' # GPU in the right order
 
-# Whisper and Torch
+# openai-whisper and pytorch
 import whisper
 import torch
 import torch.nn.functional as F
@@ -36,6 +36,8 @@ import sys
 import gzip, base64
 import copy
 import re
+import shutil
+import json
 
 # Constant variables
 from whisper.utils import format_timestamp
@@ -44,10 +46,25 @@ AUDIO_SAMPLES_PER_TOKEN = HOP_LENGTH * 2                     # 320
 AUDIO_TIME_PER_TOKEN = AUDIO_SAMPLES_PER_TOKEN / SAMPLE_RATE # 0.02 (sec)
 SEGMENT_DURATION = N_FRAMES * HOP_LENGTH / SAMPLE_RATE       # 30.0 (sec)
 
+# Access attention in latest versions...
+if whisper.__version__ >= "20240930":
+    from whisper.model import disable_sdpa
+else:
+    from contextlib import contextmanager
+
+    # Dummy context manager that does nothing
+    @contextmanager
+    def disable_sdpa():
+        try:
+            yield
+        finally:
+            pass
+
 # Logs
 import logging
 logger = logging.getLogger("whisper_timestamped")
 
+DEFAULT_BACKEND = "openai-whisper" # "transformers"
 USE_EFFICIENT_BY_DEFAULT = True
 TRUST_WHISPER_TIMESTAMP_BY_DEFAULT = True
 DISFLUENCY_MARK = "[*]"
@@ -73,8 +90,9 @@ def transcribe_timestamped(
     refine_whisper_precision=0.5,
     min_word_duration=0.02, # Was 0.04 before 1.11
     plot_word_alignment=False,
-    word_alignement_most_top_layers=None, # Was 6 before 1.9
+    word_alignment_most_top_layers=None, # Was 6 before 1.9
     remove_empty_words=False,
+    use_backend_timestamps=False,
 
     # Reproducibility
     seed=1234,
@@ -129,9 +147,12 @@ def transcribe_timestamped(
         Whether to compute word confidence.
         If True, a finer confidence for each segment will be computed as well.
 
-    vad: bool
+    vad: bool or str in ["silero", "silero:3.1", "auditok"] or list of start/end timestamps pairs corresponding to speech (ex: [(0.0, 3.50), (32.43, 36.43)])
         Whether to perform voice activity detection (VAD) on the audio file, to remove silent parts before transcribing with Whisper model.
         This should decrease hallucinations from the Whisper model.
+        When set to True, the default VAD algorithm is used (silero).
+        When set to a string, the corresponding VAD algorithm is used (silero, silero:3.1 or auditok).
+        Note that the library for the corresponding VAD algorithm must be installed.
 
     detect_disfluencies: bool
         Whether to detect disfluencies (i.e. hesitations, filler words, repetitions, corrections, etc.) that Whisper model might have omitted in the transcription.
@@ -152,6 +173,9 @@ def transcribe_timestamped(
 
     remove_empty_words: bool
         Whether to remove words with no duration occuring at the end of segments (probable Whisper hallucinations).
+
+    use_backend_timestamps: bool
+        Whether to use word timestamps provided by the backend (openai-whisper or transformers), instead of the ones computed by more complex heuristics of whisper-timestamped.
 
     seed: int
         Random seed to use for temperature sampling, for the sake of reproducibility.
@@ -204,20 +228,24 @@ def transcribe_timestamped(
     assert refine_whisper_precision >= 0 and refine_whisper_precision / AUDIO_TIME_PER_TOKEN == round(refine_whisper_precision / AUDIO_TIME_PER_TOKEN), f"refine_whisper_precision must be a positive multiple of {AUDIO_TIME_PER_TOKEN}"
     refine_whisper_precision_nframes = round(refine_whisper_precision / AUDIO_TIME_PER_TOKEN)
     assert min_word_duration >= 0, f"min_word_duration must be a positive number"
-    assert word_alignement_most_top_layers is None or word_alignement_most_top_layers > 0, f"word_alignement_most_top_layers must be a strictly positive number"
+    assert word_alignment_most_top_layers is None or word_alignment_most_top_layers > 0, f"word_alignment_most_top_layers must be a strictly positive number"
 
     if isinstance(temperature, (list, tuple)) and len(temperature) == 1:
         temperature = temperature[0]
-    if isinstance(temperature, (list, tuple)):
-        # temperature fallback
+    if isinstance(temperature, (list, tuple)): # temperature fallback
         naive_approach = True
-    elif temperature > 0 and best_of is not None and best_of > 1:
+    elif temperature > 0 and best_of is not None and best_of > 1: # random sampling
         naive_approach = True
-    if beam_size is not None:
-        # beam-search
+    if beam_size is not None: # beam-search
+        naive_approach = True
+
+    # TODO: check if efficient approach is possible with transformers backend
+    # (careful: decoding heuristics are completely different from the ones used in openai-whisper)
+    if is_transformer_model(model) or use_backend_timestamps:
         naive_approach = True
 
     # Input options
+    vad = check_vad_method(vad)
     if isinstance(model, str):
         model = load_model(model)
     if fp16 is None:
@@ -228,6 +256,10 @@ def transcribe_timestamped(
     time_precision = input_stride * HOP_LENGTH / SAMPLE_RATE
     assert time_precision == AUDIO_TIME_PER_TOKEN
 
+    alignment_heads = get_alignment_heads(model) if word_alignment_most_top_layers is None else None
+    if alignment_heads is None and word_alignment_most_top_layers is None:
+        word_alignment_most_top_layers = 6
+
     alignment_options = dict(
             remove_punctuation_from_words=remove_punctuation_from_words,
             compute_word_confidence=compute_word_confidence,
@@ -235,8 +267,8 @@ def transcribe_timestamped(
             detect_disfluencies=detect_disfluencies,
             refine_whisper_precision_nframes=refine_whisper_precision_nframes,
             plot_word_alignment=plot_word_alignment,
-            word_alignement_most_top_layers=word_alignement_most_top_layers,
-            alignment_heads=get_alignment_heads(model) if word_alignement_most_top_layers is None else None,
+            word_alignment_most_top_layers=word_alignment_most_top_layers,
+            alignment_heads=alignment_heads,
     )
     whisper_options = dict(
             language=language,
@@ -259,10 +291,12 @@ def transcribe_timestamped(
         compression_ratio_threshold=compression_ratio_threshold,
     )
 
-    if vad:
+    if vad is not None:
         audio = get_audio_tensor(audio)
-        audio, convert_timestamps = remove_non_speech(audio, plot=plot_word_alignment)
-
+        audio, vad_segments, convert_timestamps = remove_non_speech(audio, method=vad, sample_rate=SAMPLE_RATE, plot=plot_word_alignment, avoid_empty_speech=True)
+    else:
+        vad_segments = None
+    
     global num_alignment_for_plot
     num_alignment_for_plot = 0
 
@@ -270,6 +304,7 @@ def transcribe_timestamped(
         (transcription, words) = _transcribe_timestamped_naive(model, audio,
                                                                min_word_duration=0.0, # Was 0.04 before 1.11
                                                                trust_whisper_timestamps=trust_whisper_timestamps,
+                                                               use_backend_timestamps=use_backend_timestamps,
                                                                **alignment_options, **whisper_options, **other_options)
     else:
         (transcription, words) = _transcribe_timestamped_efficient(model, audio,
@@ -287,8 +322,8 @@ def transcribe_timestamped(
     for word in words:
         if verbose and not naive_approach and not vad:
             print_timestamped(word)
-        word.pop("tokens")
-        word.pop("tokens_indices")
+        word.pop("tokens", None)
+        word.pop("tokens_indices", None)
         if "avg_logprob_reliable" in word:
             word.pop("avg_logprob_reliable")
         idx_segment = word.pop("idx_segment")
@@ -316,6 +351,9 @@ def transcribe_timestamped(
             else:
                 segment["start"], segment["end"] = convert_timestamps(segment["start"], segment["end"])
 
+    if vad_segments is not None:
+        transcription["speech_activity"] = [{"start":s, "end":e} for (s,e) in vad_segments]
+
     return transcription
 
 def _transcribe_timestamped_efficient(
@@ -327,7 +365,7 @@ def _transcribe_timestamped_efficient(
     refine_whisper_precision_nframes,
     alignment_heads,
     plot_word_alignment,
-    word_alignement_most_top_layers,
+    word_alignment_most_top_layers,
     detect_disfluencies,
     trust_whisper_timestamps,
     use_timestamps_for_alignment = True,
@@ -354,13 +392,13 @@ def _transcribe_timestamped_efficient(
 
     debug = logger.getEffectiveLevel() >= logging.DEBUG
 
-    word_alignement_most_top_layers = float("inf") if word_alignement_most_top_layers is None else word_alignement_most_top_layers
+    word_alignment_most_top_layers = float("inf") if word_alignment_most_top_layers is None else word_alignment_most_top_layers
 
     # The main outcome
     timestamped_word_segments = []  # list of timestamped word segments that have been collected so far
     # Main variables to be accumulated
     segment_tokens = [[]]              # list of lists of token indices that have been collected so far (one list per segment)
-    segment_attweights = [[] for _ in range(min(word_alignement_most_top_layers, len(model.decoder.blocks)))]
+    segment_attweights = [[] for _ in range(min(word_alignment_most_top_layers, len(model.decoder.blocks)))]
                                     # attention weights on the last segments
     segment_avglogprobs = []        # average log probability for each segment (actually of the corresponding chunk, as computed by whisper)
     segment_logprobs = []           # token log probabilities for each segment
@@ -595,7 +633,7 @@ def _transcribe_timestamped_efficient(
                     tokens_filtered[-1] = tokenizer.timestamp_begin + N_FRAMES // 2 # <|30.00|>
                 segment_tokens[-1] = tokens_filtered.tolist()
 
-                # Do alignement
+                # Do alignment
                 added, unfinished_decoding, last_token_reliable = align_last_segment()
 
                 # Re-split into segments (if necessary)
@@ -851,7 +889,7 @@ def _transcribe_timestamped_efficient(
         nblocks = len(model.decoder.blocks)
         j = 0
         for i, block in enumerate(model.decoder.blocks):
-            if i < nblocks - word_alignement_most_top_layers:
+            if i < nblocks - word_alignment_most_top_layers:
                 continue
             all_hooks.append(
                 block.cross_attn.register_forward_hook(
@@ -861,7 +899,9 @@ def _transcribe_timestamped_efficient(
         if compute_word_confidence or no_speech_threshold is not None:
             all_hooks.append(model.decoder.ln.register_forward_hook(hook_output_logits))
 
-        transcription = model.transcribe(audio, **whisper_options)
+        with torch.no_grad():
+            with disable_sdpa():
+                transcription = model.transcribe(audio, **whisper_options)
 
     finally:
 
@@ -886,6 +926,9 @@ def _transcribe_timestamped_efficient(
     assert len(segment_logprobs) == len(segment_tokens), f"Inconsistent number of segments: logprobs ({len(segment_logprobs)}) != tokens ({len(segment_tokens)})"
 
     whisper_segments = transcription["segments"]
+    # See issue 64: some segments may have empty text
+    if any(not s["text"] for s in whisper_segments):
+        whisper_segments = [s for s in whisper_segments if s["text"]]
     l1 = len(whisper_segments)
     l2 = len(timestamped_word_segments)
     if l1 != l2 and l1 != 0:
@@ -965,9 +1008,10 @@ def _transcribe_timestamped_naive(
     compute_word_confidence,
     include_punctuation_in_confidence,
     refine_whisper_precision_nframes,
+    use_backend_timestamps,
     alignment_heads,
     plot_word_alignment,
-    word_alignement_most_top_layers,
+    word_alignment_most_top_layers,
     detect_disfluencies,
     trust_whisper_timestamps,
     min_word_duration,
@@ -978,7 +1022,7 @@ def _transcribe_timestamped_naive(
     language = whisper_options["language"]
     refine_whisper_precision_sec = refine_whisper_precision_nframes * AUDIO_TIME_PER_TOKEN
 
-    word_alignement_most_top_layers = float("inf") if word_alignement_most_top_layers is None else word_alignement_most_top_layers
+    word_alignment_most_top_layers = float("inf") if word_alignment_most_top_layers is None else word_alignment_most_top_layers
 
     audio = get_audio_tensor(audio)
     audio_duration = audio.shape[-1] / SAMPLE_RATE
@@ -989,12 +1033,20 @@ def _transcribe_timestamped_naive(
 
     tokenizer = get_tokenizer(model, task=whisper_options["task"], language=language)
 
+    transformer_backend = is_transformer_model(model)
+    if transformer_backend:
+        # Additional options specific to transformer models
+        whisper_options["remove_punctuation_from_words"] = remove_punctuation_from_words
+        whisper_options["use_token_timestamps"] = use_backend_timestamps
+    else:
+        whisper_options["word_timestamps"] = use_backend_timestamps
+
     language_probs = None
     def hook_output_logits(layer, ins, outs):
         nonlocal language_probs, tokenizer
         
         # Get language probabilities
-        if language_probs is None:
+        if language is None and language_probs is None:
             if outs.shape[1] == 1:
                 embedding_weights = torch.transpose(model.decoder.token_embedding.weight, 0, 1).to(outs[0].dtype)
                 index_start = tokenizer.sot + 1
@@ -1010,22 +1062,40 @@ def _transcribe_timestamped_naive(
         all_hooks.append(model.decoder.ln.register_forward_hook(hook_output_logits))
 
     try:
-        transcription = model.transcribe(audio, **whisper_options)
+        model.alignment_heads = alignment_heads # Avoid exception "AttributeError: 'WhisperUntied' object has no attribute 'alignment_heads'. Did you mean: 'set_alignment_heads'?""
+        with torch.no_grad():
+            with disable_sdpa():
+                transcription = model.transcribe(audio, **whisper_options)
     finally:
         for hook in all_hooks:
             hook.remove()
 
-    if verbose and language is None and not whisper_options["verbose"]:
+    if not transformer_backend and verbose and language is None and not whisper_options["verbose"]:
         # Reproduce whisper verbose (2/2)
         print(f"Detected language: {whisper.tokenizer.LANGUAGES[transcription['language']].title()}")
         sys.stdout.flush()
 
-    language = norm_language(transcription["language"])
+    #  End early if timestamps have been computed by the backend
+    if transcription.get("segments") and "words" in transcription["segments"][0]:
+        words = []
+        for i_segment, segment in enumerate(transcription["segments"]):
+            ws = segment.pop("words", [])
+            for w in ws:
+                # Rename openai-whisper -> whisper-timestamped
+                if "word" in w: w["text"] = w.pop("word")
+                if "probability" in w: w["confidence"] = round_confidence(w.pop("probability"))
+                w["idx_segment"] = i_segment
+            words.extend(ws)
+        if language_probs:
+            transcription["language_probs"] = language_probs
+        return transcription, words
+
+    language = norm_language(transcription.get("language", language))
     use_space = should_use_space(language)
 
     n_mels = model.dims.n_mels if hasattr(model.dims, "n_mels") else 80
 
-    attention_weights = [[] for _ in range(min(word_alignement_most_top_layers,len(model.decoder.blocks)))]
+    attention_weights = [[] for _ in range(min(word_alignment_most_top_layers, len(model.decoder.blocks)))]
 
     try:
 
@@ -1035,11 +1105,17 @@ def _transcribe_timestamped_naive(
         nblocks = len(model.decoder.blocks)
         j = 0
         for i, block in enumerate(model.decoder.blocks):
-            if i < nblocks - word_alignement_most_top_layers:
+            if i < nblocks - word_alignment_most_top_layers:
                 continue
+            def hook(layer, ins, outs, index=j):
+                if is_transformer_model(model):
+                    attention_weights[index] = outs[1].log()
+                else:
+                    attention_weights[index] = outs[1]
             all_hooks.append(
                 block.cross_attn.register_forward_hook(
-                    lambda layer, ins, outs, index=j: attention_weights.__setitem__(index, outs[-1])
+                    hook
+                    # lambda layer, ins, outs, index=j: attention_weights.__setitem__(index, outs[1])
                 )
             )
             j += 1
@@ -1149,16 +1225,24 @@ def _transcribe_timestamped_naive(
                 last_token_check = tokens[-1]
                 tokens = tokens[:-1]
 
+            sot_sequence = tokenizer.sot_sequence
+            if language and len(sot_sequence) == 3:
+                sot_sequence = (
+                    sot_sequence[0],
+                    tokenizer.to_language_token(language),
+                    sot_sequence[2],
+                )
             tokens = [
-                    *tokenizer.sot_sequence,
+                    *sot_sequence,
                     tokenizer.timestamp_begin,
                 ] + tokens
 
-            i_start = len(tokenizer.sot_sequence)
+            i_start = len(sot_sequence)
 
             with torch.no_grad():
-                logprobs = model(mfcc, torch.Tensor(tokens).int().to(model.device).unsqueeze(0))
-                logprobs = F.log_softmax(logprobs, dim=-1)
+                with disable_sdpa():
+                    logprobs = model(mfcc, torch.Tensor(tokens).int().to(model.device).unsqueeze(0))
+                    logprobs = F.log_softmax(logprobs, dim=-1)
 
             end_token = tokenizer.timestamp_begin + round(min(N_FRAMES * HOP_LENGTH, end_sample - start_sample) // AUDIO_SAMPLES_PER_TOKEN)
             tokens = tokens[i_start:] + [end_token]
@@ -1224,8 +1308,10 @@ def _transcribe_timestamped_naive(
                 segment_tokens_check.append(last_token_check)
             if trust_whisper_timestamps:
                 if segment_tokens_check != segment["tokens"]:
-                    assert len(segment_tokens_check) < len(segment["tokens"]) and segment_tokens_check[:-1] == segment["tokens"][:len(segment_tokens_check)-1], \
-                        f"Got inconsistent tokens: {tokenizer.decode(segment_tokens_check)} != {tokenizer.decode(segment['tokens'])}"
+                    assert len(segment_tokens_check) < len(segment["tokens"]), \
+                        f"First should be longer by one token: '{tokenizer.decode_with_timestamps(segment_tokens_check)}' should include '{tokenizer.decode_with_timestamps(segment['tokens'])}'"
+                    assert segment_tokens_check[:-1] == segment["tokens"][:len(segment_tokens_check)-1], \
+                        f"Got inconsistent tokens: {tokenizer.decode_with_timestamps(segment_tokens_check)} != {tokenizer.decode_with_timestamps(segment['tokens'])}"
                     segment["tokens"] = segment_tokens_check
                     segment["text"] = tokenizer.decode(segment["tokens"])
             # else: TODO
@@ -1283,6 +1369,10 @@ def print_timestamped(w):
 
 
 def get_logit_filters(model, whisper_options, prompt = None):
+    if is_transformer_model(model):
+        # import transformers
+        # transformers.WhisperTimeStampLogitsProcessor
+        raise NotImplementedError("TODO")
     decoding_options = get_decoding_options(whisper_options)
     if "initial_prompt" in decoding_options:
         prompt0 = decoding_options.pop("initial_prompt")
@@ -1314,6 +1404,15 @@ def get_decoding_options(whisper_options):
     ])
 
 def get_tokenizer(model, task="transcribe", language="en"):
+    if is_transformer_model(model):
+        tokenizer = model.tokenizer
+        tokenizer.sot_sequence = (
+            tokenizer.sot,
+            tokenizer.to_language_token(language or "en"),
+            tokenizer.to_task_token(task),
+        )
+        tokenizer.sot_sequence
+        return model.tokenizer
     try:
         return whisper.tokenizer.get_tokenizer(
             model.is_multilingual,
@@ -1768,12 +1867,61 @@ def split_tokens_on_spaces(tokens: torch.Tensor, tokenizer, remove_punctuation_f
 
     return words, word_tokens, word_tokens_indices
 
-silero_vad_model = None
+def check_vad_method(method, with_version=False):
+    """
+    Check whether the VAD method is valid and return the method in a consistent format
+
+    method: str or list or True or False
+    """
+    if method in [True, "True", "true"]:
+        return check_vad_method("silero") # default method
+    elif method in [None, False, "False", "false", "None", "none"]:
+        return None
+    elif not isinstance(method, str) and hasattr(method, '__iter__'):
+        # list of explicit timestamps
+        checked_pairs = []
+        for s_e in method:
+            assert len(s_e) == 2, f"Got unexpected element {s_e} in the list of VAD segments. Expect (start, end) pairs"
+            checked_pairs.append(tuple(s_e))
+        return checked_pairs
+    elif isinstance(method, str) and method.startswith("silero"):
+        version = None
+        if method != "silero":
+            assert method.startswith("silero:"), f"Got unexpected VAD method {method}"
+            version = method.split(":")[1]
+            if not version.startswith("v"):
+                version = "v" + version
+            try:
+                assert float(version[1:]) >= 1
+            except:
+                raise ValueError(f"Got unexpected silero version {version} (please check https://github.com/snakers4/silero-vad/wiki/Version-history-and-Available-Models)")
+        if with_version:
+            return ("silero", version)
+        else:
+            return method
+    elif method == "auditok":
+        try:
+            import auditok
+        except ImportError:
+            raise ImportError("Please install auditok to use the auditok VAD (or use another VAD method)")
+    else:
+        try:
+            method = eval(method)
+            assert hasattr(method, '__iter__')
+        except:
+            raise ValueError(f"Got unexpected VAD method {method}")
+        return check_vad_method(method, with_version=with_version)
+    return method
+
+_silero_vad_model = {}
+_has_onnx = None
 def get_vad_segments(audio,
+    sample_rate=SAMPLE_RATE,
     output_sample=False,
     min_speech_duration=0.1,
     min_silence_duration=0.1,
     dilatation=0.5,
+    method="silero",
     ):
     """
     Get speech segments from audio using Silero VAD
@@ -1788,31 +1936,128 @@ def get_vad_segments(audio,
             minimum duration (in sec) of a silence segment
         dilatation: float
             how much (in sec) to enlarge each speech segment detected by the VAD
+        method: str or list
+            VAD method to use (auditok, silero, silero:v3.1)
     """
-    global silero_vad_model, silero_get_speech_ts
+    global _silero_vad_model, _silero_get_speech_ts, _has_onnx
 
-    if silero_vad_model is None:
-        import onnxruntime
-        onnxruntime.set_default_logger_severity(3) # Remove warning "Removing initializer 'XXX'. It is not used by any node and should be removed from the model."
-        repo_or_dir = os.path.expanduser("~/.cache/torch/hub/snakers4_silero-vad_master")
-        source = "local"
-        if not os.path.exists(repo_or_dir):
-            repo_or_dir = "snakers4/silero-vad"
-            source = "github"
-        silero_vad_model, utils = torch.hub.load(repo_or_dir=repo_or_dir, model="silero_vad", onnx=True, source=source)
-        silero_get_speech_ts = utils[0]
+    if isinstance(method, list):
+        # Explicit timestamps
+        segments = [{"start": s * sample_rate, "end": e * sample_rate} for (s, e) in method]
+        dilatation = 0
 
-    # Cheap normalization of the volume
-    audio = audio / max(0.1, audio.abs().max())
+    elif isinstance(method, str) and method.startswith("silero"):
 
-    segments = silero_get_speech_ts(audio, silero_vad_model,
-        min_speech_duration_ms = round(min_speech_duration * 1000),
-        min_silence_duration_ms = round(min_silence_duration * 1000),
-        return_seconds = False,
-    )
+        version = None
+        _, version = check_vad_method(method, True)
+        # See discussion https://github.com/linto-ai/whisper-timestamped/pull/142/files#r1398326287
+        need_folder_hack = version and (version < "v4")
+
+        if _silero_vad_model.get(version) is None:
+            # ONNX support since 3.1 in silero
+            if (version is None or version >= "v3.1") and (_has_onnx is not False):
+                onnx=True
+                try:
+                    import onnxruntime
+                    onnxruntime.set_default_logger_severity(3) # Remove warning "Removing initializer 'XXX'. It is not used by any node and should be removed from the model."
+                    _has_onnx = True
+                except ImportError as err:
+                    logger.warning(f"Please install onnxruntime to use more efficiently silero VAD")
+                    _has_onnx = False
+                    onnx=False
+            else:
+                onnx=False
+
+            # Choose silero version because of problems with version 4, see  https://github.com/linto-ai/whisper-timestamped/issues/74
+            torch_home = os.environ.get('TORCH_HOME', '~/.cache/torch')
+            repo_or_dir_master = os.path.expanduser(torch_home + "/hub/snakers4_silero-vad_master")
+            repo_or_dir_specific = os.path.expanduser(torch_home + f"/hub/snakers4_silero-vad_{version}") if version else repo_or_dir_master
+            repo_or_dir = repo_or_dir_specific
+            tmp_folder = None
+            def apply_folder_hack():
+                nonlocal tmp_folder
+                if os.path.exists(repo_or_dir_master):
+                    tmp_folder = repo_or_dir_master + ".tmp"
+                    shutil.move(repo_or_dir_master, tmp_folder)
+                # Make a symlink to the v3.1 model, otherwise it fails
+                input_exists = os.path.exists(repo_or_dir_specific)
+                if not input_exists:
+                    # Make dummy file for the symlink to work
+                    os.makedirs(repo_or_dir_specific, exist_ok=True)
+                os.symlink(repo_or_dir_specific, repo_or_dir_master)
+                if not input_exists:
+                    shutil.rmtree(repo_or_dir_specific)
+
+            source = "local"
+            if not os.path.exists(repo_or_dir):
+                # Load specific version of silero
+                repo_or_dir = f"snakers4/silero-vad:{version}" if version else "snakers4/silero-vad"
+                source = "github"
+            if need_folder_hack:
+                apply_folder_hack()
+            try:
+                silero_vad_model, utils = torch.hub.load(repo_or_dir=repo_or_dir, model="silero_vad", onnx=onnx, source=source)
+                _silero_vad_model[version] = silero_vad_model
+            except ImportError as err:
+                raise RuntimeError(f"Please install what is needed to use the silero VAD (or use another VAD method)") from err
+            except Exception as err:
+                raise RuntimeError(f"Problem when installing silero with version {version}. Check versions here: https://github.com/snakers4/silero-vad/wiki/Version-history-and-Available-Models") from err
+            finally:
+                if need_folder_hack:
+                    if os.path.exists(repo_or_dir_master):
+                        os.remove(repo_or_dir_master)
+                    if tmp_folder:
+                        shutil.move(tmp_folder, repo_or_dir_master)
+            assert os.path.isdir(repo_or_dir_specific), f"Unexpected situation: missing {repo_or_dir_specific}"
+
+            _silero_get_speech_ts = utils[0]
+
+        # Cheap normalization of the volume
+        audio = audio / max(0.1, audio.abs().max())
+
+        segments = _silero_get_speech_ts(audio, _silero_vad_model[version],
+            sampling_rate = sample_rate,
+            min_speech_duration_ms = round(min_speech_duration * 1000),
+            min_silence_duration_ms = round(min_silence_duration * 1000),
+            return_seconds = False,
+        )
+
+    elif method == "auditok":
+        import auditok
+
+        # Cheap normalization of the volume
+        audio = audio / max(0.1, audio.abs().max())
+
+        data = (audio.numpy() * 32767).astype(np.int16).tobytes()
+
+        audio_duration = len(audio) / sample_rate
+
+        segments = auditok.split(
+            data,
+            sampling_rate=sample_rate,        # sampling frequency in Hz
+            channels=1,                       # number of channels
+            sample_width=2,                   # number of bytes per sample
+            min_dur=min_speech_duration,      # minimum duration of a valid audio event in seconds
+            max_dur=audio_duration,   # maximum duration of an event
+            max_silence=min(audio_duration*.95, min_silence_duration), # maximum duration of tolerated continuous silence within an event
+            energy_threshold=50,
+            drop_trailing_silence=True,
+        )
+
+        if auditok.__version__ >= "0.3.0":
+            def auditok_segment_to_dict(s):
+                return {"start": s.start * sample_rate, "end": s.end * sample_rate}
+        else:
+            def auditok_segment_to_dict(s):
+                return {"start": s._meta.start * sample_rate, "end": s._meta.end * sample_rate}
+
+        segments = [auditok_segment_to_dict(s) for s in segments]
+
+    else:
+        raise ValueError(f"Got unexpected VAD method {method}")
 
     if dilatation > 0:
-        dilatation = round(dilatation * SAMPLE_RATE)
+        dilatation = round(dilatation * sample_rate)
         new_segments = []
         for seg in segments:
             new_seg = {
@@ -1825,7 +2070,7 @@ def get_vad_segments(audio,
                 new_segments.append(new_seg)
         segments = new_segments
 
-    ratio = 1 if output_sample else 1 / SAMPLE_RATE
+    ratio = 1 if output_sample else 1 / sample_rate
 
     if ratio != 1:
         for seg in segments:
@@ -1841,24 +2086,53 @@ def remove_non_speech(audio,
     use_sample=False,
     min_speech_duration=0.1,
     min_silence_duration=1,
+    dilatation=0.5,
+    sample_rate=SAMPLE_RATE,
+    method="silero",
+    avoid_empty_speech=False,
     plot=False,
     ):
     """
     Remove non-speech segments from audio (using Silero VAD),
     glue the speech segments together and return the result along with
     a function to convert timestamps from the new audio to the original audio
+
+    parameters:
+        audio: torch.Tensor
+            audio data *in 16kHz*
+        use_sample: bool
+            if True, return start and end in samples instead of seconds
+        min_speech_duration: float
+            minimum duration (in sec) of a speech segment
+        min_silence_duration: float
+            minimum duration (in sec) of a silence segment
+        dilatation: float
+            how much (in sec) to enlarge each speech segment detected by the VAD
+        method: str
+            method to use to remove non-speech segments
+        avoid_empty_speech: bool
+            if True, avoid returning an empty speech segment (re)
+        plot: bool or str
+            if True, plot the result.
+            If a string, save the plot to the given file
     """
 
     segments = get_vad_segments(
         audio,
+        sample_rate=sample_rate,
         output_sample=True,
         min_speech_duration=min_speech_duration,
         min_silence_duration=min_silence_duration,
+        dilatation=dilatation,
+        method=method,
     )
 
     segments = [(seg["start"], seg["end"]) for seg in segments]
     if len(segments) == 0:
-        segments = [(0, audio.shape[-1])]
+        if avoid_empty_speech:
+            segments = [(0, audio.shape[-1])]
+        else:
+            return torch.Tensor([]), [], lambda t, t2 = None: t if t2 is None else [t, t2]
 
     audio_speech = torch.cat([audio[..., s:e] for s,e in segments], dim=-1)
 
@@ -1867,19 +2141,19 @@ def remove_non_speech(audio,
         plt.figure()
         max_num_samples = 10000
         step = (audio.shape[-1] // max_num_samples) + 1
-        times = [i*step/SAMPLE_RATE for i in range((audio.shape[-1]-1) // step + 1)]
+        times = [i*step/sample_rate for i in range((audio.shape[-1]-1) // step + 1)]
         plt.plot(times, audio[::step])
         for s, e in segments:
-            plt.axvspan(s/SAMPLE_RATE, e/SAMPLE_RATE, color='red', alpha=0.1)
+            plt.axvspan(s/sample_rate, e/sample_rate, color='red', alpha=0.1)
         if isinstance(plot, str):
             plt.savefig(f"{plot}.VAD.jpg", bbox_inches='tight', pad_inches=0)
         else:
             plt.show()
 
     if not use_sample:
-        segments = [(float(s)/SAMPLE_RATE, float(e)/SAMPLE_RATE) for s,e in segments]
+        segments = [(float(s)/sample_rate, float(e)/sample_rate) for s,e in segments]
  
-    return audio_speech, lambda t, t2 = None: do_convert_timestamps(segments, t, t2)
+    return audio_speech, segments, lambda t, t2 = None: do_convert_timestamps(segments, t, t2)
 
 def do_convert_timestamps(segments, t, t2 = None):
     """
@@ -2078,6 +2352,8 @@ _ALIGNMENT_HEADS = {
     "large-v1": b"ABzY8r9j$a0{>%R7#4sLmoOs{s)o3~84-RPdcFk!JR<kSfC2yj",
     "large-v2": b'ABzY8zd+h!0{>%R7=D0pU<_bnWW*tkYAhobTNnu$jnkEkXqp)j;w1Tzk)UH3X%SZd&fFZ2fC2yj',
     "large-v3": b"ABzY8gWO1E0{>%R7(9S+Kn!D~%ngiGaR?*L!iJG9p-nab0JQ=-{D1-g00",
+    "large-v3-turbo": b"ABzY8j^C+e0{>%RARaKHP%t(lGR*)0g!tONPyhe`",
+    "turbo": b"ABzY8j^C+e0{>%RARaKHP%t(lGR*)0g!tONPyhe`",
 }
 
 _PARAMETERS_TO_MODEL_NAME = {
@@ -2093,17 +2369,21 @@ _PARAMETERS_TO_MODEL_NAME = {
     1541570560 : "large-v3",
 }
 
-def get_alignment_heads(model):
+def get_alignment_heads(model, max_top_layer=3):
     if hasattr(model, "alignment_heads"): # Since version 20230306
         return model.alignment_heads
-    model_name = _PARAMETERS_TO_MODEL_NAME[_get_number_of_parameters(model)]
+    num_parameters = _get_number_of_parameters(model)
+    num_layers = model.dims.n_text_layer
+    num_heads = model.dims.n_text_head
+    if num_parameters not in _PARAMETERS_TO_MODEL_NAME:
+        logger.warning("Could not retrieve alignment heads : taking all attention heads from the top layers")
+        return None
+    model_name = _PARAMETERS_TO_MODEL_NAME[num_parameters]
     if model_name == "large":
         if next(model.parameters())[0,0,0] > 0:
             model_name = "large-v1"
         else:
-            model_name = "large-v2"
-    num_layers = model.dims.n_text_layer
-    num_heads = model.dims.n_text_head
+            model_name = "large-v3"
     return _get_alignment_heads(model_name, num_layers, num_heads)
 
 def _get_alignment_heads(model_name, num_layers, num_heads):
@@ -2114,19 +2394,87 @@ def _get_alignment_heads(model_name, num_layers, num_heads):
     return alignment_heads
 
 def _get_number_of_parameters(model):
-    return sum(p.numel() for p in model.parameters())
+    num_parameters = 0
+    for name, p in model.named_parameters():
+        if name in ["decoder.proj_out.weight", "model.encoder.embed_positions.weight"]:
+            continue
+        num_parameters += p.numel()
+    return num_parameters
 
 from typing import Optional, Union
 def load_model(
     name: str,
     device: Optional[Union[str, torch.device]] = None,
+    backend: str = DEFAULT_BACKEND,
     download_root: str = None,
     in_memory: bool = False,
 ):
+    """
+    Load a model from the given name or path.
+
+    Parameters
+    ----------
+    name : str
+        Name of the model or path to the model.
+        Examples:
+        - OpenAI-Whisper identifier: "large-v3", "medium.en", ...
+        - HuggingFace identifier: "openai/whisper-large-v3", "distil-whisper/distil-large-v2", ...
+        - File name: "path/to/model.pt", "path/to/model.ckpt", "path/to/model.bin"
+        - Folder name: "path/to/folder". The folder must contain either "pytorch_model.bin", "model.safetensors", or sharded versions of those, or "whisper.ckpt".
+    device : str or torch.device, optional
+        Device to use. If None, use CUDA if there is a GPU available, otherwise CPU.
+    backend : str, optional
+        Backend to use. Either "transformers" or "openai-whisper".
+    download_root : str, optional
+        Root folder to download the model to. If None, use the default download root (typically: ~/.cache)
+    in_memory : bool, optional
+        Whether to preload the model weights into host memory.
+    """
+    if backend == "transformers":
+        try:
+            import transformers
+        except ImportError:
+            raise ImportError(f"If you want to use transformers backend, please install first the transformers library")
+        if name in whisper.available_models():
+            name = f"openai/whisper-{name}"
+        # TODO: use download_root
+        # TODO: does in_memory makes sense?
+        cache_dir=os.path.join(download_root, "huggingface", "hub") if download_root else None,
+        try:
+            generation_config = transformers.GenerationConfig.from_pretrained(name, cache_dir=cache_dir)
+        except OSError:
+            generation_config = transformers.GenerationConfig.from_pretrained("openai/whisper-tiny", cache_dir=cache_dir)
+        processor = transformers.WhisperProcessor.from_pretrained(name, cache_dir=cache_dir)
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        precision = torch.float32
+        model = transformers.WhisperForConditionalGeneration.from_pretrained(
+            name,
+            # load_in_8bit=True,
+            # load_in_4bit=True,
+            torch_dtype=precision,
+            # torch_dtype=torch.bfloat16, 
+            # attn_implementation="flash_attention_2",
+            # attn_implementation="sdpa",
+            cache_dir=cache_dir,
+        )
+        # model = model.to_bettertransformer()
+
+        model = model.to(device)
+        return TransformerWhisperAsOpenAIWhisper(model, processor, generation_config, precision)
+    
+    elif backend not in ["openai", "openai-whisper"]:
+        raise ValueError(f"Got unexpected backend {backend}")
+
     extension = os.path.splitext(name)[-1] if os.path.isfile(name) else None
 
     if name in whisper.available_models() or extension == ".pt":
-        return whisper.load_model(name, device=device, download_root=download_root, in_memory=in_memory)
+        return whisper.load_model(
+            name,
+            device=device,
+            download_root=os.path.join(download_root, "whisper") if download_root else None,
+            in_memory=in_memory
+        )
     
     # Otherwise, assume transformers
     if extension in [".ckpt", ".bin"]:
@@ -2139,30 +2487,55 @@ def load_model(
             raise ImportError(f"If you are trying to download a HuggingFace model with {name}, please install first the transformers library")
         from transformers.utils import cached_file
 
+        kwargs = dict(
+            cache_dir=os.path.join(download_root, "huggingface", "hub") if download_root else None,
+            use_auth_token=None,
+            revision=None,
+        )
         try:
-            model_path = cached_file(name, "pytorch_model.bin", cache_dir=download_root, use_auth_token=None, revision=None)
-        except Exception as e:
+            model_path = cached_file(name, "pytorch_model.bin", **kwargs)
+        except OSError as err:
             try:
-                if isinstance(e, OSError):
-                    model_path = cached_file(name, "whisper.ckpt", cache_dir=download_root, use_auth_token=None, revision=None)
-                else:
-                    raise e
+                model_path = None
+                for candidate in ["whisper.ckpt", "pytorch_model.bin.index.json", "model.safetensors", "model.safetensors.index.json"]:
+                    try:
+                        model_path = cached_file(name, candidate, **kwargs)
+                    except OSError:
+                        continue
+                    if candidate.endswith("index.json"):
+                        index_file = model_path
+                        mapping = json.load(open(index_file))
+                        assert "weight_map" in mapping
+                        assert isinstance(mapping["weight_map"], dict)
+                        model_path = list(set(mapping["weight_map"].values()))
+                        folder = os.path.dirname(index_file)
+                        model_path = [os.path.join(folder, p) for p in model_path]
+                    break
+                assert model_path is not None
             except:
-                raise RuntimeError(f"Original error: {e}\nCould not find model {name} from HuggingFace nor local folders.")
+                raise RuntimeError(f"Original error: {err}\nCould not find model {name} from HuggingFace nor local folders.")
     # Load HF Model
-    hf_state_dict = torch.load(model_path, map_location="cpu")
+    hf_state_dict = torch_load(model_path)
+
     # Rename layers
     for key in list(hf_state_dict.keys())[:]:
         new_key = hf_to_whisper_states(key)
-        hf_state_dict[new_key] = hf_state_dict.pop(key)
+        if new_key is None:
+            hf_state_dict.pop(key)
+        elif new_key != key:
+            hf_state_dict[new_key] = hf_state_dict.pop(key)
     
-    # Remove useless key (Speechbrain
-    if "_mel_filters" in hf_state_dict:
-        hf_state_dict.pop("_mel_filters")
 
     # Init Whisper Model and replace model weights
     dims = whisper.model.ModelDimensions(**states_to_dim(hf_state_dict))
-    whisper_model = whisper.model.Whisper(dims)
+
+    if "proj_out.weight" in hf_state_dict:
+        hf_state_dict["decoder.proj_out.weight"] = hf_state_dict.pop("proj_out.weight")
+        logger.warning("Using untied projection layer")
+        whisper_model = WhisperUntied(dims)
+    else:
+        whisper_model = whisper.model.Whisper(dims)
+
     whisper_model.load_state_dict(hf_state_dict)
     del hf_state_dict
     if hasattr(whisper_model, "alignment_heads"):
@@ -2170,8 +2543,340 @@ def load_model(
     whisper_model = whisper_model.to(device)
     return whisper_model
 
+def torch_load(model_path):
+    if isinstance(model_path, list):
+        hf_state_dict = {}
+        for p in model_path:
+            d = torch_load(p)
+            for k in d:
+                assert k not in hf_state_dict, f"Found duplicate key {k} in {p}"
+            hf_state_dict.update(d)
+    else:
+        assert isinstance(model_path, str)
+        if model_path.endswith(".safetensors"):
+            from safetensors import safe_open
+            hf_state_dict = {}
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    hf_state_dict[k] = f.get_tensor(k)
+        else:
+            hf_state_dict = torch.load(model_path, map_location="cpu")
+    return hf_state_dict
+
+# Some helpers to manage transformers/openai-whisper model
+
+class TransformerWhisperAsOpenAIWhisper:
+    """
+    Wrapper to use a transformers model as a whisper model (at least in whisper-timestamped)
+    """
+
+    def __init__(self, model, processor, generation_config, precision):
+        
+        self.model = model                          # transformers.WhisperForConditionalGeneration
+        self.processor = processor                  # transformers.WhisperProcessor
+        self.generation_config = generation_config  # transformers.GenerationConfig
+
+        self.device = model.device
+        self.precision = precision
+
+        # Dimensions
+        model_config = model.config
+        self.dims = whisper.model.ModelDimensions(
+            n_mels = model_config.num_mel_bins, # model.get_encoder().get_input_embeddings().in_channels, # 80
+            n_audio_ctx = model_config.max_source_positions, # 1500
+            n_audio_state = model_config.d_model, # model.get_encoder().get_input_embeddings().out_channels, # 768
+            n_audio_head = model_config.encoder_attention_heads, # model.get_encoder().layers[0].self_attn.num_heads,
+            n_audio_layer = model_config.encoder_layers, # len(model.get_encoder().layers),
+            n_vocab = model_config.vocab_size, # model.get_decoder().get_input_embeddings().num_embeddings, # ~51865
+            n_text_ctx = model_config.max_length, # 448
+            n_text_state = model_config.d_model, # model.get_decoder().get_input_embeddings().embedding_dim, # 768
+            n_text_head = model_config.decoder_attention_heads, # model.get_decoder().layers[0].self_attn.num_heads,
+            n_text_layer = model_config.decoder_layers, # len(model.get_decoder().layers),
+        )
+
+        # Tokenization
+        self.tokenizer = processor.tokenizer
+        (
+            self.tokenizer.sot,
+            self.tokenizer.eot,
+            self.tokenizer.timestamp_begin,
+            self.tokenizer.no_speech,
+            self.tokenizer.no_timestamps,
+        ) = self.tokenizer.convert_tokens_to_ids([
+            "<|startoftranscript|>",
+            "<|endoftext|>",
+            "<|0.00|>",
+            "<|nospeech|>",
+            "<|notimestamps|>",
+        ])
+        if self.tokenizer.decode([self.tokenizer.timestamp_begin], decode_with_timestamps=True) != "<|0.00|>":
+            # Sometimes, the tokenizer is weird and it is impossible to get the timestamp_begin token easily (e.g. with "qanastek/whisper-tiny-french-cased")
+            logger.warning("Getting timestamp_begin token is not straightforward for this model")
+            i = self.tokenizer.no_timestamps + 1
+            maxi = i + 1000
+            while self.tokenizer.decode([i], decode_with_timestamps=True) != "<|0.00|>":
+                i += 1
+                if i == maxi:
+                    raise RuntimeError("Could not find timestamp_begin token")
+            self.tokenizer.timestamp_begin = i
+
+        self.tokenizer.all_language_tokens = self.tokenizer.convert_tokens_to_ids([
+            t for t in self.tokenizer.additional_special_tokens if len(t) in [6,7]
+        ])
+        # Update old Whisper generation config (ex: error: "The generation config is outdated and is thus not compatible with the `task` argument to `generate` [...] update the generation config as per the instructions https://github.com/huggingface/transformers/issues/25084#issuecomment-1664398224")
+        if not hasattr(self.generation_config, "lang_to_id"):
+            self.generation_config.lang_to_id = dict(
+                (self.tokenizer.decode(itoken), itoken)
+                for itoken in self.tokenizer.all_language_tokens
+            )
+        if not hasattr(self.generation_config, "task_to_id"):
+            self.generation_config.task_to_id = dict(
+                (task, self.tokenizer.encode("<|" + task + "|>", add_special_tokens=False)[0]) 
+                for task in ["transcribe", "translate"])
+        self.tokenizer.to_language_token = lambda language: self.generation_config.lang_to_id["<|" + norm_language(language) + "|>"]
+        self.tokenizer.to_task_token = lambda task: self.generation_config.task_to_id[task]
+
+        self.tokenizer.to_timestamp_token = lambda t: self.tokenizer.encode(f"<|{t:0.2f}|>", add_special_tokens=False)[0]
+        self.tokenizer.decode_with_timestamps = lambda tokens: self.tokenizer.decode(tokens, decode_with_timestamps=True)
+
+        self.generation_config.no_timestamps_token_id = self.tokenizer.no_timestamps
+        self.model.generation_config = self.generation_config
+
+        # Access to layers (renamed attributes)
+        self.decoder = self.model.get_decoder()
+        self.decoder.ln = self.decoder.layer_norm
+        self.decoder.token_embedding = self.decoder.embed_tokens
+        self.decoder.blocks = self.decoder.layers
+        for block in self.decoder.blocks:
+            block.cross_attn = block.encoder_attn
+
+        # From the config
+        if hasattr(generation_config, "is_multilingual"):
+            self.is_multilingual = generation_config.is_multilingual
+        else:
+            self.is_multilingual = generation_config.is_multilingual = (self.tokenizer.sot != 50257)
+
+        # Alignment heads
+        if hasattr(generation_config, "alignment_heads"):
+            a = generation_config.alignment_heads
+            self.alignment_heads = torch.sparse_coo_tensor(np.array(a).transpose(), [True]*len(a)).coalesce().to(self.device)
+
+    def named_parameters(self):
+        return self.model.named_parameters()
+    
+    def transcribe(self, audio, use_token_timestamps=False, **kwargs):
+
+        # Decoding options
+        # TODO: double check that this setup is correct
+        generation_config = self.generation_config
+        generation_config.num_beams = kwargs.get("beam_size", None) or 1
+        temperature = kwargs.get("temperature", 0.0)
+        if isinstance(temperature, (list, tuple)):
+            # Not supported with transformers
+            temperature = min(temperature)
+        if temperature != 0.0:
+            generation_config.do_sample = True
+            generation_config.temperature = temperature
+            generation_config.top_k = kwargs.get("best_of", None)
+
+        initial_prompt = kwargs.get("initial_prompt")
+        prompt_ids = self.processor.get_prompt_ids(initial_prompt) if (initial_prompt and initial_prompt.strip()) else None
+
+        generate_kwargs = dict(
+            return_dict_in_generate = True,
+            return_segments = True,
+            return_timestamps = True,
+            return_token_timestamps = use_token_timestamps,
+            max_length = self.dims.n_text_ctx,
+            is_multilingual = self.is_multilingual,
+            prompt_ids = prompt_ids,
+            generation_config = generation_config,
+        )
+        if self.is_multilingual:
+            generate_kwargs["language"] = generate_kwargs.get("language")
+            generate_kwargs["task"] = generate_kwargs.get("task", "transcribe")
+
+        # Extract features
+        features = self.processor(
+            audio,
+            return_tensors="pt",
+            sampling_rate=16_000,
+            truncation=False,
+        ).input_features.to(self.device)
+
+        # Transcribe
+        output = self.model.generate(
+            features.to(self.precision),
+            **generate_kwargs
+        )
+
+        # Because the output format is different when there is only one segment (e.g. audio duration < 30 seconds)... (WTF)
+        if "segments" not in output:
+            tokens = output.sequences[0]
+            new_output = {
+                "segments": [[{
+                    "tokens": tokens[1:],
+                    "start": torch.tensor(0.0),
+                    "result": {
+                        "sequences": output.sequences[0],
+                        "past_key_values": output.past_key_values,
+                    }
+                }]]
+            }
+            if use_token_timestamps:
+                new_output["segments"][0][0]["result"]["token_timestamps"] = output.token_timestamps[0]
+            output = new_output
+
+        # Language detection
+        first_segment_tokens = output["segments"][0][0]["tokens"].tolist()
+        if self.tokenizer.sot in first_segment_tokens:
+            i_sot = first_segment_tokens.index(self.tokenizer.sot)
+        else:
+            i_sot = -1
+        if self.is_multilingual:
+            language = self.tokenizer.decode([first_segment_tokens[i_sot+1]], decode_with_timestamps=True)
+            assert len(language) in [6,7], f"Unexpected language detected: '{language}' ({first_segment_tokens[i_sot+1]}) in '{self.tokenizer.decode(first_segment_tokens, decode_with_timestamps=True)}'"
+            language = language[2:-2]
+        else:
+            language = "en"
+
+        if use_token_timestamps:
+            remove_punctuation_from_words = kwargs.get("remove_punctuation_from_words", False)
+            use_space = should_use_space(language)
+
+        full_text = ""
+        segments = []
+        for id, (segment_dict, segment) in enumerate(self._iter_segments(output, prompt_ids)):
+
+            segment_dict = segment_dict |  {
+                "temperature": temperature,
+                # "avg_logprob": -0.6982866287231445,
+                # "compression_ratio": 0.5294117647058824,
+                # "no_speech_prob": 0.019023602828383446
+            }
+
+            # Accumulate
+            if use_token_timestamps:
+                tokens = segment_dict["tokens_no_timestamp"]
+                offset = segment_dict["offset"]
+                all_tokens = segment["result"]["sequences"].tolist()
+                token_timestamps = segment["result"]["token_timestamps"]
+                assert len(all_tokens) == len(token_timestamps)
+                n_tokens = len(tokens)
+                for i in range(0, len(all_tokens) + 1 - n_tokens):
+                    if all_tokens[i:i+n_tokens] == tokens:
+                        token_timestamps = token_timestamps[i:i+n_tokens+1]
+                        break
+                assert len(tokens)+1 == len(token_timestamps)
+                split_tokens = split_tokens_on_spaces if use_space else split_tokens_on_unicode
+                words, word_tokens, word_tokens_indices = split_tokens(tokens, self.tokenizer, remove_punctuation_from_words=remove_punctuation_from_words)
+                words_dicts = []
+                i_end = 0
+                for w, toks in zip(words, word_tokens_indices):
+                    i_start = i_end
+                    i_end = i_start + len(toks)
+                    words_dicts.append({
+                        "text": w,
+                        "start": offset + token_timestamps[i_start].item(),
+                        "end": offset + token_timestamps[i_end].item(),
+                        # "probability": 0.199
+                    })
+                segment_dict["words"] = words_dicts
+
+            segment_dict.pop("tokens_no_timestamp")
+            segment_dict.pop("offset")
+            segments.append(segment_dict)
+            full_text += segment_dict["text"]
+
+        output_dict = {
+            "text": full_text,
+            "segments": segments,
+        }
+        if not kwargs.get("language"):
+            output_dict["language"] = language
+
+        return output_dict
+    
+    def _iter_segments(self, output, prompt_ids):
+
+        id = -1
+        for sub_segments in output["segments"]:
+            for segment in sub_segments:
+                id += 1
+                chunk_start = round(max(0, segment["start"].item()), 2)
+                tokens = segment["tokens"]
+                if id == 0 and prompt_ids is not None:
+                    tokens = tokens[len(prompt_ids):]
+                time_tokens = [(i, t.item()) for i, t in enumerate(tokens) if t >= self.tokenizer.timestamp_begin]
+                i = 0
+                while i < len(time_tokens):
+                    i_start, token_start = time_tokens[i]
+                    relative_start = round((token_start - self.tokenizer.timestamp_begin) * AUDIO_TIME_PER_TOKEN, 2)
+                    assert relative_start >= 0
+                    if i == 0:
+                        offset = chunk_start - relative_start
+                        assert offset >= 0, f"Got negative offset ({offset}) with {chunk_start=} and {relative_start=}"
+                    has_end = i + 1 < len(time_tokens)
+                    if has_end:
+                        i_end, token_end = time_tokens[i+1]
+                        # Ends on either consecutive timestamps, or the next timestamp followed by <|endoftext|>
+                        while i + 2 < len(time_tokens):
+                            if time_tokens[i+2][0] == i_end + 1: break
+                            if i_end + 1 >= len(tokens) or tokens[i_end+1] in [self.tokenizer.eot]: break
+                            logger.warning(f"Unexpected prediction without 2 consecutive timestamps")
+                            i += 1
+                            i_end, token_end = time_tokens[i+1]
+                        relative_end = round((token_end - self.tokenizer.timestamp_begin) * AUDIO_TIME_PER_TOKEN, 2)
+                    else:
+                        i_end = len(tokens) - 1
+                        if tokens[i_end] == self.tokenizer.eot: i_end -= 1
+                        relative_end = SEGMENT_DURATION
+                    start = offset + relative_start
+                    duration = relative_end - relative_start
+                    assert duration >= 0, f"Got negative duration ({duration}) with {relative_end=} and {relative_start=}"
+                    tokens_with_timestamps = tokens[i_start:i_end+1] # include timestamps
+                    text = self.tokenizer.decode(tokens_with_timestamps, skip_special_tokens=True)
+                    tokens_with_timestamps = tokens_with_timestamps.tolist()
+                    tokens_no_timestamp = tokens_with_timestamps[1:-1] if has_end else tokens_with_timestamps[1:]
+                    i += 2
+                    if not len(tokens_no_timestamp): continue
+                    yield (
+                        {
+                            "id": id,
+                            "seek": round(offset * SAMPLE_RATE / HOP_LENGTH),
+                            "start": start,
+                            "end": start + duration,
+                            "text": text,
+                            "tokens": tokens_with_timestamps,
+                            "tokens_no_timestamp": tokens_no_timestamp,
+                            "offset": offset,
+                        },
+                        segment,
+                    )
+
+
+    def __call__(self, mfcc, tokens):
+        output = self.model(mfcc.to(self.precision), decoder_input_ids=tokens, output_attentions=True)
+        return output.logits
+
+
+def is_transformer_model(model):
+    return isinstance(model, TransformerWhisperAsOpenAIWhisper)
+
+
 # Credit: https://github.com/openai/whisper/discussions/830
 def hf_to_whisper_states(text):
+    # From Speechbrain
+    if text == "_mel_filters":
+        return None
+    
+    # From PEFT
+    if "default" in text:
+        # print(f"WARNING: Ignoring {text}")
+        return None
+    if text.startswith("base_model.model."):
+        text = text[len("base_model.model."):]
+
     text = re.sub('.layers.', '.blocks.', text)
     text = re.sub('.self_attn.', '.attn.', text)
     text = re.sub('.q_proj.', '.query.', text)
@@ -2209,6 +2914,45 @@ def states_to_dim(state_dict):
         "n_text_layer":  len(set([".".join(k.split(".")[:3]) for k in state_dict.keys() if "decoder.blocks." in k])), # 4 / 6 / 12 / 24 / 32
     }
 
+class TextDecoderUntied(whisper.model.TextDecoder):
+    """
+    Same as TextDecoder but with untied weights
+    """
+    def __init__(self, *args, **kwargs):
+        import torch
+        super().__init__(*args, **kwargs)
+
+        n_vocab, n_state = self.token_embedding.weight.shape
+
+        self.proj_out = torch.nn.Linear(n_state, n_vocab, bias=False)
+
+    def forward(self, x, xa, kv_cache = None):
+        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
+        x = x.to(xa.dtype)
+
+        for block in self.blocks:
+            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+
+        x = self.ln(x)
+
+        # logits = self.proj_out(x).float()
+        # logits = (x @ torch.transpose(self.proj_out.weight.to(x.dtype), 0, 1)).float()
+        logits = self.proj_out.to(x.dtype)(x).float()
+
+        return logits
+
+class WhisperUntied(whisper.model.Whisper):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.decoder = TextDecoderUntied(
+            self.dims.n_vocab,
+            self.dims.n_text_ctx,
+            self.dims.n_text_state,
+            self.dims.n_text_head,
+            self.dims.n_text_layer,
+        )
+
 def cli():
 
     import os
@@ -2230,14 +2974,14 @@ def cli():
         def do_write(transcript, file, output_format):
             writer = get_writer(output_format, os.path.curdir)
             try:
-                return writer.write_result({"segments": transcript}, file)
-            except TypeError:
-                # Version > 20230314
                 return writer.write_result({"segments": list(transcript)}, file, {
                     "highlight_words": False,
                     "max_line_width": None,
                     "max_line_count": None,
                 })
+            except TypeError:
+                # Version <= 20230314
+                return writer.write_result({"segments": transcript}, file)
         def get_do_write(output_format):
             return lambda transcript, file: do_write(transcript, file, output_format)
 
@@ -2258,6 +3002,7 @@ def cli():
     parser.add_argument('--model', help=f"name of the Whisper model to use. Examples: {', '.join(whisper.available_models())}", default="small")
     parser.add_argument("--model_dir", default=None, help="the path to save model files; uses ~/.cache/whisper by default", type=str)
     parser.add_argument("--device", default=get_default_device(), help="device to use for PyTorch inference")
+    parser.add_argument("--backend", default=DEFAULT_BACKEND, help="Which backend to use", choices=["openai-whisper", "transformers"], type=str)
     parser.add_argument("--output_dir", "-o", default=None, help="directory to save the outputs", type=str)
     valid_formats = ["txt", "vtt", "srt", "tsv", "csv", "json"]
     def str2output_formats(string):
@@ -2274,7 +3019,10 @@ def cli():
     parser.add_argument('--language', help=f"language spoken in the audio, specify None to perform language detection.", choices=sorted(whisper.tokenizer.LANGUAGES.keys()) + sorted([k.title() for k in whisper.tokenizer.TO_LANGUAGE_CODE.keys()]), default=None)
     # f"{', '.join(sorted(k+'('+v+')' for k,v in whisper.tokenizer.LANGUAGES.items()))}
 
-    parser.add_argument('--vad', default=False, help="whether to run Voice Activity Detection (VAD) to remove non-speech segment before applying Whisper model (removes hallucinations)", type=str2bool)
+    parser.add_argument('--vad', default=False, help="whether to run Voice Activity Detection (VAD) to remove non-speech segment before applying Whisper model (removes hallucinations). "
+                        "Can be: True, False, auditok, silero (default when vad=True), silero:3.1 (or another version), or a list of timestamps in seconds (e.g. \"[(0.0, 3.50), (32.43, 36.43)]\"). "
+                        "Note: Some additional libraries might be needed (torchaudio and onnxruntime for silero, auditok for auditok)."
+    )
     parser.add_argument('--detect_disfluencies', default=False, help="whether to try to detect disfluencies, marking them as special words [*]", type=str2bool)
     parser.add_argument('--recompute_all_timestamps', default=not TRUST_WHISPER_TIMESTAMP_BY_DEFAULT, help="Do not rely at all on Whisper timestamps (Experimental option: did not bring any improvement, but could be useful in cases where Whipser segment timestamp are wrong by more than 0.5 seconds)", type=str2bool)
     parser.add_argument("--punctuations_with_words", default=True, help="whether to include punctuations in the words", type=str2bool)
@@ -2299,7 +3047,7 @@ def cli():
     parser.add_argument("--compute_confidence", default=True, help="whether to compute confidence scores for words", type=str2bool)
     parser.add_argument("--verbose", type=str2bool, default=False, help="whether to print out the progress and debug messages of Whisper")
     parser.add_argument('--plot', help="plot word alignments (save the figures if an --output_dir is specified, otherwhise just show figures that have to be closed to continue)", default=False, action="store_true")
-    parser.add_argument('--debug', help="print some debug information about word alignement", default=False, action="store_true")
+    parser.add_argument('--debug', help="print some debug information about word alignment", default=False, action="store_true")
 
     class ActionSetAccurate(argparse.Action):
         def __init__(self, option_strings, dest, nargs=None, **kwargs):
@@ -2309,7 +3057,7 @@ def cli():
             setattr(namespace, "best_of", 5)
             setattr(namespace, "beam_size", 5)
             setattr(namespace, "temperature_increment_on_fallback", 0.2)
-    parser.add_argument('--accurate', help="Shortcut to use the same default option as in Whisper (best_of=5, beam_search=5, temperature_increment_on_fallback=0.2)", action=ActionSetAccurate)
+    parser.add_argument('--accurate', help="Shortcut to use the same default option as in openai-whisper (best_of=5, beam_search=5, temperature_increment_on_fallback=0.2)", action=ActionSetAccurate)
 
     class ActionSetEfficient(argparse.Action):
         def __init__(self, option_strings, dest, nargs=None, **kwargs):
@@ -2348,8 +3096,9 @@ def cli():
         force_cudnn_initialization(device)
 
     output_format = args.pop("output_format")
+    backend = args.pop("backend")
 
-    model = load_model(model, device=device, download_root=model_dir)
+    model = load_model(model, device=device, download_root=model_dir, backend=backend)
 
     plot_word_alignment = args.pop("plot")
 
@@ -2433,6 +3182,7 @@ def filtered_keys(result, keys = [
     "end",
     "confidence",
     "language_probs",
+    "speech_activity",
 ]):
     if isinstance(result, dict):
         return {k: (filtered_keys(v, keys) if k not in ["language_probs"] else v) for k, v in result.items() if k in keys}

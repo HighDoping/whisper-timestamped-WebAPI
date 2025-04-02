@@ -489,12 +489,37 @@ class TestTranscribeMonolingual(TestHelperCli):
 
 class TestTranscribeWithVad(TestHelperCli):
 
-    def test_vad(self):
+    def test_vad_default(self):
         self._test_cli_(
-                ["--model", "large", "--accurate", "--language", "en", "--vad", "True", "--verbose", "True"],
+                ["--model", "tiny", "--accurate", "--language", "en", "--vad", "True", "--verbose", "True"],
                 "verbose",
                 files=["words.wav"],
                 prefix="vad",
+                extensions=None,
+            )
+
+    def test_vad_custom_silero(self):
+        self._test_cli_(
+                ["--model", "tiny", "--accurate", "--language", "en", "--vad", "silero:v3.1", "--verbose", "True"],
+                "verbose",
+                files=["words.wav"],
+                prefix="vad_silero3.1",
+                extensions=None,
+            )
+        self._test_cli_(
+                ["--model", "tiny", "--accurate", "--language", "en", "--vad", "silero:v3.0", "--verbose", "True"],
+                "verbose",
+                files=["words.wav"],
+                prefix="vad_silero3.0",
+                extensions=None,
+            )
+
+    def test_vad_custom_auditok(self):
+        self._test_cli_(
+                ["--model", "tiny", "--language", "en", "--vad", "auditok", "--verbose", "True"],
+                "verbose",
+                files=["words.wav"],
+                prefix="vad_auditok",
                 extensions=None,
             )
 
@@ -634,6 +659,28 @@ class TestHuggingFaceModel(TestHelperCli):
             prefix="hf",
             device_specific=True,
         )
+
+        import tempfile
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor, GenerationConfig
+        tempfolder = os.path.join(tempfile.gettempdir(), "tmp_whisper-tiny-french-cased")
+
+        for safe_serialization in False, True,:
+            for max_shard_size in "100MB", "10GB", :
+                shutil.rmtree(tempfolder, ignore_errors=True)
+                model = WhisperForConditionalGeneration.from_pretrained("qanastek/whisper-tiny-french-cased")
+                processor = WhisperProcessor.from_pretrained("qanastek/whisper-tiny-french-cased")
+                try:
+                    model.save_pretrained(tempfolder, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
+                    processor.save_pretrained(tempfolder)
+                    self._test_cli_(
+                        ["--model", tempfolder, "--verbose", "True"],
+                        "verbose", files=["bonjour.wav"], extensions=None,
+                        prefix="hf",
+                        device_specific=True,
+                    )
+                finally:
+                    shutil.rmtree(tempfolder)
+
 
 # "ZZZ" to run this test at last (because it will fill the CUDA with some memory)
 class TestZZZPythonImport(TestHelper):
